@@ -1,3 +1,4 @@
+import json
 import rados
 import rbd
 import re
@@ -13,8 +14,9 @@ from ceph_iscsi_config.gateway_setting import TCMU_SETTINGS
 from ceph_iscsi_config.backstore import USER_RBD
 from ceph_iscsi_config.utils import (convert_2_bytes, gen_control_string,
                                      valid_size, get_pool_id, ip_addresses,
-                                     get_pools, get_rbd_size, this_host,
-                                     human_size, CephiSCSIError)
+                                     get_pools, get_rbd_size, run_shell_cmd,
+                                     human_size, CephiSCSIError, this_host,
+                                     is_erasure_pool)
 from ceph_iscsi_config.gateway_object import GWObject
 from ceph_iscsi_config.target import GWTarget
 from ceph_iscsi_config.client import GWClient, CHAP
@@ -46,7 +48,7 @@ class RBDDev(object):
         ]
     }
 
-    def __init__(self, image, size, backstore, pool=None):
+    def __init__(self, image, size, backstore, pool=None, is_erasure=False):
         self.image = image
         self.size_bytes = convert_2_bytes(size)
         self.backstore = backstore
@@ -58,6 +60,8 @@ class RBDDev(object):
         self.error_msg = ''
         self.changed = False
 
+        self.is_erasure_pool = is_erasure_pool(settings, pool)
+
     def create(self):
         """
         Create an rbd image compatible with exporting through LIO to multiple
@@ -67,14 +71,20 @@ class RBDDev(object):
 
         with rados.Rados(conffile=settings.config.cephconf,
                          name=settings.config.cluster_client_name) as cluster:
-            with cluster.open_ioctx(self.pool) as ioctx:
+            _pool = self.pool
+            data_pool = None
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+                data_pool = self.pool
+            with cluster.open_ioctx(_pool) as ioctx:
                 rbd_inst = rbd.RBD()
                 try:
                     rbd_inst.create(ioctx,
                                     self.image,
                                     self.size_bytes,
                                     features=RBDDev.default_features(self.backstore),
-                                    old_format=False)
+                                    old_format=False,
+                                    data_pool=data_pool)
 
                 except (rbd.ImageExists, rbd.InvalidArgument) as err:
                     self.error = True
@@ -95,7 +105,10 @@ class RBDDev(object):
 
         with rados.Rados(conffile=settings.config.cephconf,
                          name=settings.config.cluster_client_name) as cluster:
-            with cluster.open_ioctx(self.pool) as ioctx:
+            _pool = self.pool
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+            with cluster.open_ioctx(_pool) as ioctx:
                 rbd_inst = rbd.RBD()
 
                 ctr = 0
@@ -139,7 +152,10 @@ class RBDDev(object):
 
         with rados.Rados(conffile=settings.config.cephconf,
                          name=settings.config.cluster_client_name) as cluster:
-            with cluster.open_ioctx(self.pool) as ioctx:
+            _pool = self.pool
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+            with cluster.open_ioctx(_pool) as ioctx:
                 with rbd.Image(ioctx, self.image) as rbd_image:
 
                     # get the current size in bytes
@@ -166,7 +182,10 @@ class RBDDev(object):
 
         with rados.Rados(conffile=settings.config.cephconf,
                          name=settings.config.cluster_client_name) as cluster:
-            with cluster.open_ioctx(self.pool) as ioctx:
+            _pool = self.pool
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+            with cluster.open_ioctx(_pool) as ioctx:
                 with rbd.Image(ioctx, self.image) as rbd_image:
                     image_size = rbd_image.size()
 
@@ -186,7 +205,11 @@ class RBDDev(object):
             pool = settings.config.pool
 
         with rados.Rados(conffile=conf, name=settings.config.cluster_client_name) as cluster:
-            with cluster.open_ioctx(pool) as ioctx:
+            is_erasure = is_erasure_pool(settings, pool)
+            _pool = pool
+            if is_erasure:
+                _pool = settings.config.pool
+            with cluster.open_ioctx(_pool) as ioctx:
                 rbd_inst = rbd.RBD()
                 rbd_names = rbd_inst.list(ioctx)
         return rbd_names
@@ -222,7 +245,10 @@ class RBDDev(object):
         valid_state = True
         with rados.Rados(conffile=settings.config.cephconf,
                          name=settings.config.cluster_client_name) as cluster:
-            ioctx = cluster.open_ioctx(self.pool)
+            _pool = self.pool
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+            ioctx = cluster.open_ioctx(_pool)
             with rbd.Image(ioctx, self.image) as rbd_image:
 
                 if rbd_image.features() & RBDDev.required_features(self.backstore) != \
@@ -290,7 +316,7 @@ class LUN(GWObject):
     }
 
     def __init__(self, logger, pool, image, size, allocating_host,
-                 backstore, backstore_object_name):
+                 backstore, backstore_object_name, is_erasure=False):
         self.logger = logger
         self.image = image
         self.pool = pool
@@ -305,6 +331,8 @@ class LUN(GWObject):
         self.error = False
         self.error_msg = ''
         self.num_changes = 0
+
+        self.is_erasure_pool = is_erasure_pool(settings, pool)
 
         try:
             super(LUN, self).__init__('disks', self.config_key, logger,
@@ -574,6 +602,33 @@ class LUN(GWObject):
             if client_err:
                 raise CephiSCSIError(client_err)
 
+    def _erasure_pool_check(self):
+        if not self.is_erasure_pool:
+            return None
+
+        data, err = run_shell_cmd(
+            "ceph -n {client_name} --conf {cephconf} osd metadata --format=json".
+            format(client_name=settings.config.cluster_client_name,
+                   cephconf=settings.config.cephconf))
+        if err:
+            self.logger.error("Cannot get the objectstore type")
+            return err
+        store_type = json.loads(data)[0]['osd_objectstore']
+        self.logger.debug(f"pool ({self.pool}) objectstore type is ({store_type})")
+        if store_type not in ['bluestore', 'filestore']:
+            self.logger.error("Only bluestore/filestore objectstores allowed for erasure pool")
+            return err
+
+        data, err = run_shell_cmd(
+            "ceph -n {client_name} --conf {cephconf} osd pool get {pool} allow_ec_overwrites".
+            format(client_name=settings.config.cluster_client_name,
+                   cephconf=settings.config.cephconf, pool=self.pool))
+        if err:
+            self.logger.error(f"Cannot get allow_ec_overwrites from pool ({self.pool})")
+            return err
+        self.logger.debug(f"erasure pool ({self.pool}) allow_ec_overwrites is enabled")
+        return None
+
     def allocate(self, keep_dev_in_lio=True, in_wwn=None):
         """
         Create image and add to LIO and config.
@@ -583,6 +638,10 @@ class LUN(GWObject):
         :return: LIO storage object if successful and keep_dev_in_lio=True
                  else None.
         """
+        err = self._erasure_pool_check()
+        if err:
+            return None
+
         self.logger.debug("LUN.allocate starting, listing rbd devices")
         disk_list = RBDDev.rbd_list(pool=self.pool)
         self.logger.debug("rados pool '{}' contains the following - "
@@ -888,7 +947,10 @@ class LUN(GWObject):
         try:
             # config string = rbd identifier / config_key (pool/image) /
             # optional osd timeout
-            cfgstring = "rbd/{}/{};osd_op_timeout={}".format(self.pool,
+            _pool = self.pool
+            if self.is_erasure_pool:
+                _pool = settings.config.pool
+            cfgstring = "rbd/{}/{};osd_op_timeout={}".format(_pool,
                                                              self.image,
                                                              self.osd_op_timeout)
             if (settings.config.cephconf != '/etc/ceph/ceph.conf'):
@@ -1224,7 +1286,11 @@ class LUN(GWObject):
 
                 logger.debug("Processing rbd's in '{}' pool".format(pool))
 
-                with cluster.open_ioctx(pool) as ioctx:
+                is_erasure = is_erasure_pool(settings, pool)
+                _pool = pool
+                if is_erasure:
+                    _pool = settings.config.pool
+                with cluster.open_ioctx(_pool) as ioctx:
 
                     pool_disks = [disk_key for disk_key in srtd_disks
                                   if disk_key.startswith(pool + '/')]

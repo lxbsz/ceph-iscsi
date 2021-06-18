@@ -6,6 +6,7 @@ import rbd
 import re
 import datetime
 import os
+import json
 
 import ceph_iscsi_config.settings as settings
 
@@ -36,6 +37,23 @@ def run_shell_cmd(cmd, stderr=None, shell=True):
     except subprocess.CalledProcessError as err:
         return None, err
     return result, None
+
+
+def is_erasure_pool(settings, pool):
+    data, err = run_shell_cmd(
+        "ceph -n {client_name} --conf {cephconf} osd dump --format=json".
+        format(client_name=settings.config.cluster_client_name,
+               cephconf=settings.config.cephconf))
+    if err:
+        raise CephiSCSIError("Erasure pool check failed {}".format(err))
+
+    for _pool in json.loads(data)['pools']:
+        if _pool['pool_name'] == pool:
+            # 3 is erasure pool
+            if _pool['type'] != 3:
+                return False
+            return True
+    raise CephiSCSIError("Pool ({}) not found".format(pool))
 
 
 def normalize_ip_address(ip_address):

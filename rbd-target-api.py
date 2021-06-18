@@ -35,7 +35,7 @@ from ceph_iscsi_config.client import GWClient, CHAP
 from ceph_iscsi_config.common import Config
 from ceph_iscsi_config.utils import (normalize_ip_literal, resolve_ip_addresses,
                                      ip_addresses, read_os_release, encryption_available,
-                                     CephiSCSIError, this_host)
+                                     CephiSCSIError, this_host, is_erasure_pool)
 from ceph_iscsi_config.device_status import DeviceStatusWatcher
 
 from gwcli.utils import (APIRequest, valid_gateway, valid_client,
@@ -1007,6 +1007,11 @@ def disk(pool, image):
     logger.debug("this host is {}".format(local_gw))
 
     image_id = '{}/{}'.format(pool, image)
+    is_erasure = is_erasure_pool(settings, pool)
+    if is_erasure:
+        _image_id = '/'.join([settings.config.pool, image])
+    else:
+        _image_id = image_id
 
     config.refresh()
 
@@ -1015,7 +1020,7 @@ def disk(pool, image):
         if image_id in config.config['disks']:
             disk_dict = config.config["disks"][image_id]
             global dev_status_watcher
-            disk_status = dev_status_watcher.get_dev_status(image_id)
+            disk_status = dev_status_watcher.get_dev_status(_image_id)
             if disk_status:
                 disk_dict['status'] = disk_status.get_status_dict()
             else:

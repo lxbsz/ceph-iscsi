@@ -53,6 +53,22 @@ class Disks(UIGroup):
         self.scan_queue = None
         self.scan_mutex = None
 
+    def _get_pool_type(self, pool):
+        root = self.get_ui_root()
+        pools = root.ceph.cluster.pools
+        pool_object = pools.pool_lookup.get(pool, None)
+        if pool_object:
+            return pool_object.type
+        return None
+
+    def _get_erasure_image_id(self, image_id):
+        _pool, _rbd_image = image_id.split('/', 1)
+        _type = self._get_pool_type(_pool)
+        if _type and _type == 'erasure':
+            return '/'.join([settings.config.pool, _rbd_image])
+        else:
+            return image_id
+
     def _get_disk_meta(self, cluster_ioctx, disk_meta):
         """
         Use the provided cluster context to take an rbd image name from the
@@ -114,7 +130,8 @@ class Disks(UIGroup):
 
         # Load the queue
         for disk_name in disk_info.keys():
-            self.scan_queue.put(disk_name)
+            _disk_name = self._get_erasure_image_id(disk_name)
+            self.scan_queue.put(_disk_name)
 
         start_time = int(time.time())
         scan_threads = []
@@ -277,12 +294,12 @@ class Disks(UIGroup):
         pools = root.ceph.cluster.pools
         pool_object = pools.pool_lookup.get(pool, None)
         if pool_object:
-            if pool_object.type == 'replicated':
-                self.logger.debug("pool '{}' is ok to use".format(pool))
+            if pool_object.type in ['replicated', 'erasure']:
+                self.logger.debug(f"pool '{pool}' is ok to use")
                 return True
 
-        self.logger.error("Invalid pool ({}). Must already exist and "
-                          "be replicated".format(pool))
+        self.logger.error(f"Invalid pool ({pool}), the type is ({pool_object.type})."
+                          " Must already exist and be erasure or replicated")
         return False
 
     def create_disk(self, pool=None, image=None, size=None, count=1,
@@ -603,12 +620,29 @@ class DiskPool(UIGroup):
         self.disks_meta = disks_meta
         self.refresh()
 
+    def _get_pool_type(self, pool):
+        root = self.get_ui_root()
+        pools = root.ceph.cluster.pools
+        pool_object = pools.pool_lookup.get(pool, None)
+        if pool_object:
+            return pool_object.type
+        return None
+
+    def _get_erasure_image_id(self, image_id):
+        _pool, _rbd_image = image_id.split('/', 1)
+        _type = self._get_pool_type(_pool)
+        if _type and _type == 'erasure':
+            return '/'.join([settings.config.pool, _rbd_image])
+        else:
+            return image_id
+
     def refresh(self):
         for pool_disk_config in self.pool_disks_config:
             disk_id = '{}/{}'.format(pool_disk_config['pool'], pool_disk_config['image'])
-            size = self.disks_meta[disk_id].get('size', 0) if self.disks_meta else None
-            features = self.disks_meta[disk_id].get('features', 0) if self.disks_meta else None
-            snapshots = self.disks_meta[disk_id].get('snapshots', []) if self.disks_meta else None
+            _disk_id = self._get_erasure_image_id(disk_id)
+            size = self.disks_meta[_disk_id].get('size', 0) if self.disks_meta else None
+            features = self.disks_meta[_disk_id].get('features', 0) if self.disks_meta else None
+            snapshots = self.disks_meta[_disk_id].get('snapshots', []) if self.disks_meta else None
             Disk(self,
                  image_id=disk_id,
                  image_config=pool_disk_config,
@@ -736,7 +770,6 @@ class Disk(UINode):
                     'disk/{}'.format(self.http_mode, settings.config.api_port,
                                      self.image_id))
 
-        self.logger.debug("disk GET status for {}".format(self.image_id))
         api = APIRequest(disk_api)
         api.get()
 

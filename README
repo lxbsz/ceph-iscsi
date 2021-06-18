@@ -95,6 +95,11 @@ curl --user admin:admin -d ip_address=2006:ac81::1104 \
 NOTE: please make sure both the IPv4 and IPv6 addresses are in the trusted
 ip list in iscsi-gateway.cfg.
 
+Erasure Pool Support:
+For the erasure pool, there has no any special thing need to do beforehand, you can just
+use it like the replicated pools. But internally the ceph-iscsi will use the replicated
+'rbd' pool to save the meta data as defualt and use the erasure pool to save the data for
+all the images.
 
 ## Installation
 ### Via RPM
